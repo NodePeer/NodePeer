@@ -76,7 +76,10 @@ std::string FormatSubVersion(const std::string& name, int nClientVersion, const 
         ss << ")";
     }
     ss << "/";
-    ss << "NodePeer:" << FormatVersion(PEERCOIN_VERSION);
+    ss << "NodePeer:" << strprintf("%d.%d.%d", PEERCOIN_VERSION_MAJOR,
+                               PEERCOIN_VERSION_MINOR,
+                               PEERCOIN_VERSION_REVISION);
+    ss << "/";
     return ss.str();
 }
 
