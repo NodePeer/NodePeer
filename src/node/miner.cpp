@@ -728,6 +728,11 @@ void static ThreadStakeMinter(NodeContext& m_node)
         } catch (...) {
             PrintExceptionContinue(NULL, "ThreadStakeMinter()");
         }
+        // PoSMiner threw. Back off before retrying so a persistent failure
+        // cannot spin, and stop retrying once Interrupt() has been called:
+        // Shutdown() joins this thread and would otherwise never return.
+        if (!m_node.connman->interruptNet.sleep_for(std::chrono::seconds(10)))
+            break;
     }
     LogPrintf("ThreadStakeMinter exiting\n");
 }

@@ -245,6 +245,15 @@ void Shutdown(NodeContext& node)
     for (const auto& client : node.chain_clients) {
         client->flush();
     }
+
+    // Join the stake minter before anything it uses is stopped or destroyed:
+    // it calls ConnectBlock (script-check queue), holds raw pointers to
+    // connman and the wallet, and dereferences chainman and mempool. It
+    // exits at its next interruptNet sleep, which Interrupt() has triggered.
+    if (m_minter_thread.joinable()) {
+        m_minter_thread.join();
+    }
+
     StopMapPort();
 
     // Because these depend on each-other, we make sure that neither can be
@@ -334,10 +343,6 @@ void Shutdown(NodeContext& node)
     node.mempool.reset();
     node.chainman.reset();
     node.scheduler.reset();
-
-    if (m_minter_thread.joinable()) {
-        m_minter_thread.join();
-    }
 
     try {
         if (!fs::remove(GetPidFile(*node.args))) {
