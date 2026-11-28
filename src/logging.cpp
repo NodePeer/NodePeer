@@ -389,7 +389,7 @@ namespace BCLog {
     }
 } // namespace BCLog
 
-void BCLog::Logger::LogPrintStr(const std::string& str, const std::string& logging_function, const std::string& source_file, int source_line, BCLog::LogFlags category, BCLog::Level level)
+void BCLog::Logger::LogPrintStr(const std::string& str, const std::string& logging_function, const std::string& source_file, int source_line, BCLog::LogFlags category, BCLog::Level level, bool should_ratelimit)
 {
     StdLockGuard scoped_lock(m_cs);
     std::string str_prefixed = LogEscapeMessage(str);
@@ -433,6 +433,41 @@ void BCLog::Logger::LogPrintStr(const std::string& str, const std::string& loggi
         return;
     }
 
+    // Rate limit unconditional logging to disk per source location
+    // (CVE-2025-54605). Console output and callbacks are not limited.
+    // The quota is charged with the bytes that would be written to disk.
+    bool ratelimit_suppress{false};
+    std::string ratelimit_notice;
+    if (m_ratelimit && m_print_to_file) {
+        const auto notice_prefix = [this] {
+            return m_log_timestamps ? FormatISO8601DateTime(GetTime()) + " " : std::string{};
+        };
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_ratelimit_window_start >= RATELIMIT_WINDOW) {
+            for (const auto& [loc, loc_stats] : m_ratelimit_stats) {
+                if (loc_stats.dropped_bytes == 0) continue;
+                ratelimit_notice += notice_prefix() + strprintf("Restarting logging from %s:%d: %d bytes were dropped during the last time window.\n", loc.first, loc.second, loc_stats.dropped_bytes);
+            }
+            m_ratelimit_stats.clear();
+            m_ratelimit_window_start = now;
+        }
+        if (should_ratelimit) {
+            const uint64_t bytes{str_prefixed.size()};
+            auto& stats = m_ratelimit_stats[std::make_pair(source_file, source_line)];
+            if (stats.dropped_bytes > 0) {
+                stats.dropped_bytes += bytes;
+                ratelimit_suppress = true;
+            } else if (bytes > stats.available_bytes) {
+                stats.available_bytes = 0;
+                stats.dropped_bytes = bytes;
+                ratelimit_suppress = true;
+                ratelimit_notice += notice_prefix() + strprintf("Excessive logging detected from %s:%d (%s): more than %d bytes logged during the current time window. Suppressing logging to disk from this source location until the window resets.\n", source_file, source_line, logging_function, RATELIMIT_MAX_BYTES);
+            } else {
+                stats.available_bytes -= bytes;
+            }
+        }
+    }
+
     if (m_print_to_console) {
         // print to console
         fwrite(str_prefixed.data(), 1, str_prefixed.size(), stdout);
@@ -454,7 +489,8 @@ void BCLog::Logger::LogPrintStr(const std::string& str, const std::string& loggi
                 m_fileout = new_fileout;
             }
         }
-        FileWriteStr(str_prefixed, m_fileout);
+        if (!ratelimit_notice.empty()) FileWriteStr(ratelimit_notice, m_fileout);
+        if (!ratelimit_suppress) FileWriteStr(str_prefixed, m_fileout);
     }
 }
 

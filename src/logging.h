@@ -12,12 +12,15 @@
 #include <util/string.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 static const bool DEFAULT_LOGTIMEMICROS = false;
@@ -25,6 +28,7 @@ static const bool DEFAULT_LOGIPS        = false;
 static const bool DEFAULT_LOGTIMESTAMPS = true;
 static const bool DEFAULT_LOGTHREADNAMES = false;
 static const bool DEFAULT_LOGSOURCELOCATIONS = false;
+static const bool DEFAULT_LOGRATELIMIT = true;
 extern const char * const DEFAULT_DEBUGLOGFILE;
 
 extern bool fLogIPs;
@@ -79,6 +83,9 @@ namespace BCLog {
         None, // Internal use only
     };
     constexpr auto DEFAULT_LOG_LEVEL{Level::Debug};
+    //! Bytes each source location may log to disk per time window.
+    constexpr uint64_t RATELIMIT_MAX_BYTES{1024 * 1024};
+    constexpr std::chrono::hours RATELIMIT_WINDOW{1};
 
     class Logger
     {
@@ -95,6 +102,14 @@ namespace BCLog {
          * newline.
          */
         std::atomic_bool m_started_new_line{true};
+
+        //! Per source location log rate limiting state (CVE-2025-54605).
+        struct RateLimitStats {
+            uint64_t available_bytes{RATELIMIT_MAX_BYTES};
+            uint64_t dropped_bytes{0};
+        };
+        std::map<std::pair<std::string, int>, RateLimitStats> m_ratelimit_stats GUARDED_BY(m_cs);
+        std::chrono::steady_clock::time_point m_ratelimit_window_start GUARDED_BY(m_cs){std::chrono::steady_clock::now()};
 
         //! Category-specific log level. Overrides `m_log_level`.
         std::unordered_map<LogFlags, Level> m_category_log_levels GUARDED_BY(m_cs);
@@ -119,12 +134,13 @@ namespace BCLog {
         bool m_log_time_micros = DEFAULT_LOGTIMEMICROS;
         bool m_log_threadnames = DEFAULT_LOGTHREADNAMES;
         bool m_log_sourcelocations = DEFAULT_LOGSOURCELOCATIONS;
+        bool m_ratelimit = DEFAULT_LOGRATELIMIT;
 
         fs::path m_file_path;
         std::atomic<bool> m_reopen_file{false};
 
         /** Send a string to the log output */
-        void LogPrintStr(const std::string& str, const std::string& logging_function, const std::string& source_file, int source_line, BCLog::LogFlags category, BCLog::Level level);
+        void LogPrintStr(const std::string& str, const std::string& logging_function, const std::string& source_file, int source_line, BCLog::LogFlags category, BCLog::Level level, bool should_ratelimit);
 
         /** Returns whether logs will be written to any output */
         bool Enabled() const
@@ -216,7 +232,7 @@ bool GetLogCategory(BCLog::LogFlags& flag, const std::string& str);
 // peer can fill up a user's disk with debug.log entries.
 
 template <typename... Args>
-static inline void LogPrintf_(const std::string& logging_function, const std::string& source_file, const int source_line, const BCLog::LogFlags flag, const BCLog::Level level, const char* fmt, const Args&... args)
+static inline void LogPrintf_(const std::string& logging_function, const std::string& source_file, const int source_line, const BCLog::LogFlags flag, const BCLog::Level level, const bool should_ratelimit, const char* fmt, const Args&... args)
 {
     if (LogInstance().Enabled()) {
         std::string log_msg;
@@ -226,17 +242,17 @@ static inline void LogPrintf_(const std::string& logging_function, const std::st
             /* Original format string will have newline so don't add one here */
             log_msg = "Error \"" + std::string(fmterr.what()) + "\" while formatting log message: " + fmt;
         }
-        LogInstance().LogPrintStr(log_msg, logging_function, source_file, source_line, flag, level);
+        LogInstance().LogPrintStr(log_msg, logging_function, source_file, source_line, flag, level, should_ratelimit);
     }
 }
 
-#define LogPrintLevel_(category, level, ...) LogPrintf_(__func__, __FILE__, __LINE__, category, level, __VA_ARGS__)
+#define LogPrintLevel_(category, level, should_ratelimit, ...) LogPrintf_(__func__, __FILE__, __LINE__, category, level, should_ratelimit, __VA_ARGS__)
 
 // Log unconditionally.
-#define LogPrintf(...) LogPrintLevel_(BCLog::LogFlags::NONE, BCLog::Level::None, __VA_ARGS__)
+#define LogPrintf(...) LogPrintLevel_(BCLog::LogFlags::NONE, BCLog::Level::None, /*should_ratelimit=*/true, __VA_ARGS__)
 
 // Log unconditionally, prefixing the output with the passed category name.
-#define LogPrintfCategory(category, ...) LogPrintLevel_(category, BCLog::Level::None, __VA_ARGS__)
+#define LogPrintfCategory(category, ...) LogPrintLevel_(category, BCLog::Level::None, /*should_ratelimit=*/true, __VA_ARGS__)
 
 // Use a macro instead of a function for conditional logging to prevent
 // evaluating arguments when logging for the category is not enabled.
@@ -245,7 +261,7 @@ static inline void LogPrintf_(const std::string& logging_function, const std::st
 #define LogPrint(category, ...)                                        \
     do {                                                               \
         if (LogAcceptCategory((category), BCLog::Level::Debug)) {      \
-            LogPrintLevel_(category, BCLog::Level::None, __VA_ARGS__); \
+            LogPrintLevel_(category, BCLog::Level::None, /*should_ratelimit=*/false, __VA_ARGS__); \
         }                                                              \
     } while (0)
 
@@ -253,14 +269,27 @@ static inline void LogPrintf_(const std::string& logging_function, const std::st
 #define LogPrintLevel(category, level, ...)               \
     do {                                                  \
         if (LogAcceptCategory((category), (level))) {     \
-            LogPrintLevel_(category, level, __VA_ARGS__); \
+            LogPrintLevel_(category, level, (level) >= BCLog::Level::Info, __VA_ARGS__); \
         }                                                 \
     } while (0)
 
-template <typename... Args>
-bool error(const char* fmt, const Args&... args)
+/** Format string plus the caller's source location, so that every call site
+ *  of a logging wrapper (error(), WalletLogPrintf()) gets its own log rate
+ *  limiting bucket (CVE-2025-54605).
+ *  The constructor is intentionally implicit. */
+struct ErrorFormat {
+    const char* fmt;
+    const char* file;
+    const char* func;
+    int line;
+    ErrorFormat(const char* fmt_in, const char* file_in = __builtin_FILE(), const char* func_in = __builtin_FUNCTION(), int line_in = __builtin_LINE())
+        : fmt{fmt_in}, file{file_in}, func{func_in}, line{line_in} {}
+};
+
+template<typename... Args>
+bool error(ErrorFormat fmt, const Args&... args)
 {
-    LogPrintf("ERROR: %s\n", tfm::format(fmt, args...));
+    LogPrintf_(fmt.func, fmt.file, fmt.line, BCLog::LogFlags::NONE, BCLog::Level::None, /*should_ratelimit=*/true, "ERROR: %s\n", tfm::format(fmt.fmt, args...));
     return false;
 }
 

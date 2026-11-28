@@ -851,8 +851,8 @@ public:
 
     /** Prepends the wallet name in logging output to ease debugging in multi-wallet use cases */
     template<typename... Params>
-    void WalletLogPrintf(std::string fmt, Params... parameters) const {
-        LogPrintf(("%s " + fmt).c_str(), GetDisplayName(), parameters...);
+    void WalletLogPrintf(ErrorFormat fmt, Params... parameters) const {
+        LogPrintf_(fmt.func, fmt.file, fmt.line, BCLog::LogFlags::NONE, BCLog::Level::None, /*should_ratelimit=*/true, ("%s " + std::string(fmt.fmt)).c_str(), GetDisplayName(), parameters...);
     };
 
     /** Upgrade the wallet */

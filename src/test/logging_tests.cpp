@@ -83,10 +83,10 @@ BOOST_AUTO_TEST_CASE(logging_timer)
 BOOST_FIXTURE_TEST_CASE(logging_LogPrintf_, LogSetup)
 {
     LogInstance().m_log_sourcelocations = true;
-    LogPrintf_("fn1", "src1", 1, BCLog::LogFlags::NET, BCLog::Level::Debug, "foo1: %s", "bar1\n");
-    LogPrintf_("fn2", "src2", 2, BCLog::LogFlags::NET, BCLog::Level::None, "foo2: %s", "bar2\n");
-    LogPrintf_("fn3", "src3", 3, BCLog::LogFlags::NONE, BCLog::Level::Debug, "foo3: %s", "bar3\n");
-    LogPrintf_("fn4", "src4", 4, BCLog::LogFlags::NONE, BCLog::Level::None, "foo4: %s", "bar4\n");
+    LogPrintf_("fn1", "src1", 1, BCLog::LogFlags::NET, BCLog::Level::Debug, /*should_ratelimit=*/false, "foo1: %s", "bar1\n");
+    LogPrintf_("fn2", "src2", 2, BCLog::LogFlags::NET, BCLog::Level::None, /*should_ratelimit=*/false, "foo2: %s", "bar2\n");
+    LogPrintf_("fn3", "src3", 3, BCLog::LogFlags::NONE, BCLog::Level::Debug, /*should_ratelimit=*/false, "foo3: %s", "bar3\n");
+    LogPrintf_("fn4", "src4", 4, BCLog::LogFlags::NONE, BCLog::Level::None, /*should_ratelimit=*/false, "foo4: %s", "bar4\n");
     std::ifstream file{tmp_log_path};
     std::vector<std::string> log_lines;
     for (std::string log; std::getline(file, log);) {
@@ -243,6 +243,39 @@ BOOST_FIXTURE_TEST_CASE(logging_Conf, LogSetup)
         BOOST_CHECK(http_it != category_levels.end());
         BOOST_CHECK_EQUAL(http_it->second, BCLog::Level::Info);
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(logging_ratelimit, LogSetup)
+{
+    const bool prev_ratelimit{LogInstance().m_ratelimit};
+    LogInstance().m_ratelimit = true;
+
+    // Log 2 MiB (2048 lines of 1024 bytes) from a single source location,
+    // twice the quota. LogSetup disables timestamps and other prefixes, so
+    // each line is exactly 1024 bytes on disk.
+    const std::string line(1023, 'a');
+    for (int i = 0; i < 2048; ++i) {
+        LogPrintf("%s\n", line);
+    }
+    // A different source location must still be able to log.
+    LogPrintf("log from another location\n");
+
+    std::ifstream file{tmp_log_path};
+    uint64_t payload_lines{0};
+    int notices{0};
+    bool found_other{false};
+    for (std::string log; std::getline(file, log);) {
+        if (log == line) ++payload_lines;
+        if (log.find("Excessive logging detected") != std::string::npos) ++notices;
+        if (log.find("log from another location") != std::string::npos) found_other = true;
+    }
+
+    // Exactly the quota is written, then the location is suppressed.
+    BOOST_CHECK_EQUAL(payload_lines, BCLog::RATELIMIT_MAX_BYTES / 1024);
+    BOOST_CHECK_EQUAL(notices, 1);
+    BOOST_CHECK(found_other);
+
+    LogInstance().m_ratelimit = prev_ratelimit;
 }
 
 BOOST_AUTO_TEST_SUITE_END()
